@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# virtual env
+.venv/
+venv/
+
+# environment variables
+.env
+
+# exports
+exports/
+
+# database
+*.db
+
+# IDE
+.vscode/
+.idea/
