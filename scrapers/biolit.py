@@ -14,10 +14,10 @@ def _infer_location_from_block(block_text: str) -> str:
     if not block_text:
         return ""
 
-    m = PLACE_RX.search(block_text)
-    if m:
-        loc = clean_text(m.group(1))
-        return loc[:80]
+    match = PLACE_RX.search(block_text)
+    if match:
+        location = clean_text(match.group(1))
+        return location[:80]
 
     low = block_text.lower()
     if "stockholm" in low or "sthlm" in low:
@@ -40,14 +40,17 @@ def _infer_location_from_block(block_text: str) -> str:
 
 def _is_probable_title(line: str) -> bool:
     """
-    Heuristic: titles are usually short-ish, not boilerplate, and not containing 'Inkom'/'Uppdragsnummer'.
+    Heuristic: titles are usually short-ish, not boilerplate,
+    and should not look like metadata lines.
     """
     if not line:
         return False
+
     low = line.lower()
 
     if "inkom" in low or "uppdragsnummer" in low:
         return False
+
     if low in {
         "aktuella konsultuppdrag",
         "konsultuppdrag",
@@ -57,42 +60,39 @@ def _is_probable_title(line: str) -> bool:
     }:
         return False
 
-    # too long -> probably body text
     if len(line) > 90:
         return False
 
-    # avoid lines that look like phone/email
     if "@" in line or "070" in line or "073" in line or "08-" in line:
         return False
 
-    # needs some letters
     return any(ch.isalpha() for ch in line)
 
 
 def fetch(url: str):
     """
-    Biolit konsultuppdrag is a single long page.
-    The Inkom/date and Uppdragsnummer may be split across lines, so we:
-      - find 'Inkom: YYYY-MM-DD' line
-      - look ahead for 'Uppdragsnummer: NNNN' within next few lines
-      - use the nearest probable title line above as title
+    Biolit is a single long page.
+
+    Important:
+    We must NOT use #fragment-based URLs because canonicalize_url()
+    removes fragments. Instead we create a stable query-param URL
+    per assignment number.
     """
     results = []
 
     try:
-        r = requests.get(
+        response = requests.get(
             url,
             timeout=20,
             headers={"Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8"},
         )
-        r.raise_for_status()
-    except Exception as e:
-        print(f"Error fetching {url}: {e}")
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"Error fetching {url}: {exc}")
         return results
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    # Ensure <br> becomes newlines
     for br in soup.find_all("br"):
         br.replace_with("\n")
 
@@ -102,65 +102,74 @@ def fetch(url: str):
 
     canon_base = canonicalize_url(url)
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        m_date = INCOMING_DATE_RX.search(line)
-        if not m_date:
-            i += 1
+    index = 0
+    seen_assignment_numbers = set()
+
+    while index < len(lines):
+        line = lines[index]
+        date_match = INCOMING_DATE_RX.search(line)
+        if not date_match:
+            index += 1
             continue
 
-        published = m_date.group(1)
+        published = date_match.group(1)
 
-        # Uppdragsnummer might be on same line or next lines
         assignment_no = ""
-        # check current + next 3 lines
-        for k in range(0, 4):
-            if i + k >= len(lines):
+        for offset in range(0, 4):
+            current_index = index + offset
+            if current_index >= len(lines):
                 break
-            m_no = ASSIGNMENT_NO_RX.search(lines[i + k])
-            if m_no:
-                assignment_no = m_no.group(1)
+
+            number_match = ASSIGNMENT_NO_RX.search(lines[current_index])
+            if number_match:
+                assignment_no = number_match.group(1)
                 break
 
         if not assignment_no:
-            i += 1
+            index += 1
             continue
 
-        # Title = scan backwards for nearest probable title
+        if assignment_no in seen_assignment_numbers:
+            index += 1
+            continue
+        seen_assignment_numbers.add(assignment_no)
+
         title = ""
         for back in range(1, 8):
-            idx = i - back
-            if idx < 0:
+            title_index = index - back
+            if title_index < 0:
                 break
-            cand = lines[idx]
-            if _is_probable_title(cand):
-                title = cand
+
+            candidate = lines[title_index]
+            if _is_probable_title(candidate):
+                title = candidate
                 break
 
         if not title:
-            # fallback: if we can't find title, skip (or set generic)
-            i += 1
+            index += 1
             continue
 
-        # Build a "block" for location inference: from title down a bit
         block_lines = [title]
-        for j in range(i, min(i + 20, len(lines))):
+        for j in range(index, min(index + 20, len(lines))):
             block_lines.append(lines[j])
+
         block_text = "\n".join(block_lines)
         location = _infer_location_from_block(block_text)
 
-        job_url = f"{canon_base}#uppdrag-{assignment_no}"
+        # Use query param instead of fragment so canonicalize_url keeps uniqueness.
+        job_url = f"{canon_base}?assignment_no={assignment_no}"
 
-        results.append({
-            "id": f"biolit-{assignment_no}",  # stable
-            "title": title,
-            "company": "Biolit",
-            "location": location,
-            "published": published,
-            "url": job_url
-        })
+        results.append(
+            {
+                "id": f"biolit-{assignment_no}",
+                "title": title,
+                "company": "Biolit",
+                "location": location,
+                "published": published,
+                "url": job_url,
+            }
+        )
 
-        i += 1
+        index += 1
 
     return results

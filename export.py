@@ -1,23 +1,23 @@
-# export.py
-import os
 import csv
+import os
 import sqlite3
+from typing import Sequence
+
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-from database import DB_NAME
 import app_config
+from database import DB_NAME
 
 XLSX_PATH = os.path.join(app_config.EXPORT_DIR, "assignments.xlsx")
 CSV_PATH = os.path.join(app_config.EXPORT_DIR, "assignments.csv")
 
 
-def fetch_assignments():
+def fetch_assignments() -> tuple[list[str], list[tuple]]:
     conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    # DB-enforced UNIQUE(company,url) => ingen dedup behövs i export.
-    cursor.execute("""
+    cur = conn.cursor()
+    cur.execute(
+        """
         SELECT
             title,
             company,
@@ -27,10 +27,10 @@ def fetch_assignments():
             url,
             scraped_at
         FROM assignments
-        ORDER BY scraped_at DESC
-    """)
-
-    rows = cursor.fetchall()
+        ORDER BY scraped_at DESC, company ASC, title ASC
+        """
+    )
+    rows = cur.fetchall()
     conn.close()
 
     headers = [
@@ -45,61 +45,61 @@ def fetch_assignments():
     return headers, rows
 
 
-def export_csv(headers, rows):
+def export_csv(headers: Sequence[str], rows: Sequence[Sequence]) -> None:
     os.makedirs(app_config.EXPORT_DIR, exist_ok=True)
-
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as file_obj:
+        writer = csv.writer(file_obj)
         writer.writerow(headers)
         writer.writerows(rows)
-
     print(f"Wrote CSV: {CSV_PATH}")
 
 
-def export_xlsx(headers, rows):
+def export_xlsx(headers: Sequence[str], rows: Sequence[Sequence]) -> None:
     os.makedirs(app_config.EXPORT_DIR, exist_ok=True)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "assignments"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "assignments"
 
-    ws.append(headers)
+    worksheet.append(list(headers))
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
-    # Freeze header + filter
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
+    url_column_index = headers.index("url") + 1
 
-    url_col_index = headers.index("url") + 1  # 1-based
-
-    for row_idx, row in enumerate(rows, start=2):
-        ws.append(list(row))
-        url_value = row[url_col_index - 1]
+    for row_index, row in enumerate(rows, start=2):
+        worksheet.append(list(row))
+        url_value = row[url_column_index - 1]
         if url_value:
-            cell = ws.cell(row=row_idx, column=url_col_index)
+            cell = worksheet.cell(row=row_index, column=url_column_index)
             cell.hyperlink = url_value
             cell.value = url_value
             cell.style = "Hyperlink"
 
-    # Autosize columns (cap)
-    for col_idx in range(1, len(headers) + 1):
+    for col_index in range(1, len(headers) + 1):
         max_len = 0
-        # Cap scanning for speed
-        for r in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 2000), min_col=col_idx, max_col=col_idx):
-            v = r[0].value
-            if v is None:
+        for row in worksheet.iter_rows(
+            min_row=1,
+            max_row=min(worksheet.max_row, 2000),
+            min_col=col_index,
+            max_col=col_index,
+        ):
+            value = row[0].value
+            if value is None:
                 continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+            max_len = max(max_len, len(str(value)))
+        worksheet.column_dimensions[get_column_letter(col_index)].width = min(max_len + 2, 60)
 
-    wb.save(XLSX_PATH)
+    workbook.save(XLSX_PATH)
     print(f"Wrote XLSX: {XLSX_PATH}")
 
 
-def export_all():
+def export_all() -> dict:
     headers, rows = fetch_assignments()
     export_csv(headers, rows)
     export_xlsx(headers, rows)
     print(f"Export complete. Rows: {len(rows)}")
+    return {"rows": len(rows), "csv_path": CSV_PATH, "xlsx_path": XLSX_PATH}
 
 
 if __name__ == "__main__":

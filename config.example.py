@@ -12,11 +12,22 @@ SCRAPER_TIMEOUT_S = int(os.getenv("SCRAPER_TIMEOUT_S", "300"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 SWEDEN_ONLY = os.getenv("SWEDEN_ONLY", "1").strip().lower() in (
-    "1", "true", "yes", "y", "on"
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
 )
 
 USE_SUBPROCESS = os.getenv("USE_SUBPROCESS", "1").strip().lower() in (
-    "1", "true", "yes", "y", "on"
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
 )
+
+SCRAPER_RETRIES = int(os.getenv("SCRAPER_RETRIES", "1"))
+SCRAPER_RETRY_BACKOFF_S = float(os.getenv("SCRAPER_RETRY_BACKOFF_S", "1.5"))
 
 MP_CTX = mp.get_context("spawn")

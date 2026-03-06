@@ -1,5 +1,6 @@
 import requests
-from utils import generate_id, clean_text
+
+from utils import clean_text, normalize_url
 
 
 API_URL = "https://tingent.se/api/jobs"
@@ -8,116 +9,172 @@ API_URL = "https://tingent.se/api/jobs"
 def _extract_items(data) -> list:
     """
     Tingent API can return either a list or a dict containing a list.
-    We normalize to a list of dict items.
+    Normalize to a list of dict items.
     """
     if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
+        return [item for item in data if isinstance(item, dict)]
 
     if isinstance(data, dict):
         for key in ("jobs", "data", "results", "items"):
-            v = data.get(key)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
 
-        # last resort: first list value in dict
-        for v in data.values():
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
+        for value in data.values():
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
 
     return []
 
 
+def _extract_source_id(item: dict) -> str:
+    for key in (
+        "abstract_id",
+        "id",
+        "job_id",
+        "jobId",
+        "requisition_id",
+        "requisitionId",
+        "uuid",
+        "slug",
+    ):
+        value = item.get(key)
+        if value is not None:
+            value = clean_text(str(value))
+            if value:
+                return value
+    return ""
+
+
+def _extract_title(item: dict) -> str:
+    return clean_text(
+        str(
+            item.get("requisition_name")
+            or item.get("title")
+            or item.get("name")
+            or item.get("role")
+            or ""
+        )
+    )
+
+
+def _extract_location(item: dict) -> str:
+    return clean_text(
+        str(
+            item.get("location_city")
+            or item.get("location_name")
+            or item.get("requisition_locationid")
+            or item.get("location")
+            or item.get("city")
+            or item.get("office")
+            or ""
+        )
+    )
+
+
+def _extract_published(item: dict) -> str:
+    return clean_text(
+        str(
+            item.get("published")
+            or item.get("published_at")
+            or item.get("created")
+            or item.get("created_at")
+            or ""
+        )
+    )
+
+
+def _build_job_url(item: dict, listing_url: str, source_id: str) -> str:
+    """
+    Try to use a real job URL if the API provides one.
+    If not, create a stable unique fallback based on the listing URL.
+    """
+    candidates = [
+        item.get("url"),
+        item.get("publicUrl"),
+        item.get("public_url"),
+        item.get("job_url"),
+        item.get("jobUrl"),
+        item.get("absolute_url"),
+        item.get("absoluteUrl"),
+        item.get("permalink"),
+        item.get("link"),
+        item.get("href"),
+        item.get("path"),
+        item.get("slug"),
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        candidate = clean_text(str(candidate))
+        if not candidate:
+            continue
+
+        # Absolute URL
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            return candidate
+
+        # Relative path or slug
+        if candidate.startswith("/"):
+            return normalize_url("https://tingent.se", candidate)
+
+        # Slug-like fallback
+        if "/" not in candidate and " " not in candidate and len(candidate) < 120:
+            return normalize_url("https://tingent.se", f"/jobs/{candidate}")
+
+    # Stable unique fallback. Even if Tingent ignores the query string,
+    # it still lands on the right site and remains unique for dedupe.
+    separator = "&" if "?" in listing_url else "?"
+    return f"{listing_url}{separator}job_id={source_id}"
+
+
 def fetch(url: str):
     """
-    Tingent: fetch via their public API (API first, no Playwright).
-    Returns list of:
-    {
-        "id": str,
-        "title": str,
-        "company": str,
-        "location": str,
-        "published": str,
-        "url": str
-    }
+    Tingent: fetch via their public API.
+
+    Critical fix:
+    Never fall back to the exact same listing URL for every item.
+    If the API lacks a real detail URL, we generate a stable unique URL
+    using the source id.
     """
     results = []
 
     try:
-        r = requests.get(API_URL, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print(f"Error fetching {API_URL}: {e}")
+        response = requests.get(API_URL, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"Error fetching {API_URL}: {exc}")
         return results
 
     items = _extract_items(data)
-    seen_ids = set()
+    seen_source_ids = set()
 
     for item in items:
-        title = clean_text(
-            str(
-                item.get("requisition_name")
-                or item.get("title")
-                or item.get("name")
-                or item.get("role")
-                or ""
-            )
-        )
+        title = _extract_title(item)
         if not title or len(title) < 4:
             continue
+
         if title.strip().lower() in {"jobs", "job", "english"}:
             continue
 
-        # Prefer stable source id from API
-        source_id = item.get("abstract_id") or item.get("id")
+        source_id = _extract_source_id(item)
         if not source_id:
             continue
-        source_id = str(source_id).strip()
-        if not source_id or source_id in seen_ids:
+
+        if source_id in seen_source_ids:
             continue
-        seen_ids.add(source_id)
+        seen_source_ids.add(source_id)
 
-        # Prefer explicit job URL if present. Do not guess paths (avoid hacks).
-        job_url = (
-            item.get("url")
-            or item.get("publicUrl")
-            or item.get("public_url")
-            or ""
-        )
-        job_url = clean_text(str(job_url))
-        if not job_url:
-            # fallback to listing url passed into fetch()
-            job_url = url
-
-        location = clean_text(
-            str(
-                item.get("location_city")
-                or item.get("location_name")
-                or item.get("requisition_locationid")
-                or item.get("location")
-                or item.get("city")
-                or item.get("office")
-                or ""
-            )
-        )
-
-        published = clean_text(
-            str(
-                item.get("published")
-                or item.get("published_at")
-                or item.get("created")
-                or item.get("created_at")
-                or ""
-            )
-        )
-
-        # Deterministic namespaced id to avoid cross-company collisions
-        # Use source_id since it's stable, and namespace it.
-        stable_id = f"tingent-{source_id}"
+        location = _extract_location(item)
+        published = _extract_published(item)
+        job_url = _build_job_url(item, url, source_id)
 
         results.append(
             {
-                "id": stable_id,
+                "id": f"tingent-{source_id}",
                 "title": title,
                 "company": "Tingent",
                 "location": location,

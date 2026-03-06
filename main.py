@@ -1,19 +1,19 @@
 import importlib
 import logging
+import multiprocessing as mp
+import threading
 import time
+import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing as mp
-import traceback
+from dataclasses import dataclass
 from typing import Any
-import threading
 
 import config
-
-from geo import is_sweden_assignment
-from app_config import SCRAPERS, OUTPUTS
+from app_config import OUTPUTS, SCRAPERS, ScraperConfig
 from database import init_db, save_assignments
 from export import export_all
+from geo import is_sweden_assignment
 from quality import validate_assignment
 
 logger = logging.getLogger(__name__)
@@ -24,8 +24,21 @@ logging.basicConfig(
 )
 
 
-def _is_sweden_only(item: dict) -> bool:
-    return is_sweden_assignment(item.get("location") or "", item.get("title") or "")
+@dataclass
+class ScraperResult:
+    module: str
+    fetch_s: float
+    found: int
+    results: list[dict]
+    status: str
+    error: str = ""
+
+
+def _safe_len(value: Any) -> int:
+    try:
+        return len(value)
+    except Exception:
+        return 0
 
 
 def _get_location_filter() -> str:
@@ -33,16 +46,13 @@ def _get_location_filter() -> str:
 
 
 def _matches_location_filter(item: dict, wanted: str) -> bool:
-    loc = (item.get("location") or "").lower()
+    location = (item.get("location") or "").lower()
     title = (item.get("title") or "").lower()
-    return wanted in loc or wanted in title
+    return wanted in location or wanted in title
 
 
-def _safe_len(x: Any) -> int:
-    try:
-        return len(x)
-    except Exception:
-        return 0
+def _is_sweden_only(item: dict) -> bool:
+    return is_sweden_assignment(item.get("location") or "", item.get("title") or "")
 
 
 def _child_logging_init() -> None:
@@ -55,19 +65,17 @@ def _child_logging_init() -> None:
 def _scraper_process_entry(conn, module_name: str, url: str) -> None:
     _child_logging_init()
     try:
-        t0 = time.perf_counter()
+        started = time.perf_counter()
         module = importlib.import_module(f"scrapers.{module_name}")
         results = module.fetch(url)
-        dt = time.perf_counter() - t0
+        duration = time.perf_counter() - started
 
         if results is None:
             results = []
         if not isinstance(results, list):
-            raise TypeError(
-                f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}"
-            )
+            raise TypeError(f"{module_name}.fetch() must return list[dict], got {type(results)}")
 
-        conn.send(("ok", module_name, float(dt), int(len(results)), results))
+        conn.send(("ok", module_name, duration, len(results), results))
     except Exception:
         conn.send(("err", module_name, traceback.format_exc()))
     finally:
@@ -77,97 +85,168 @@ def _scraper_process_entry(conn, module_name: str, url: str) -> None:
             pass
 
 
-def _run_scraper_with_timeout(module_name: str, url: str, timeout_s: int):
-    """
-    Hard timeout via subprocess (spawn).
-    Returns: (module, fetch_s, found, results, status, err)
-    status: ok | timeout | error
-    """
+def _run_scraper_with_timeout(module_name: str, url: str, timeout_s: int) -> ScraperResult:
     parent_conn, child_conn = config.MP_CTX.Pipe(duplex=False)
-    p = config.MP_CTX.Process(
+    process = config.MP_CTX.Process(
         target=_scraper_process_entry,
         args=(child_conn, module_name, url),
         daemon=True,
     )
 
     try:
-        p.start()
-    except Exception as e:
+        process.start()
+    except Exception as exc:
         try:
             parent_conn.close()
             child_conn.close()
         except Exception:
             pass
-        return (module_name, 0.0, 0, [], "error", f"Failed to start subprocess: {e}")
+        return ScraperResult(module_name, 0.0, 0, [], "error", f"Failed to start subprocess: {exc}")
 
     try:
         child_conn.close()
     except Exception:
         pass
 
-    p.join(timeout_s)
+    process.join(timeout_s)
 
-    if p.is_alive():
-        p.terminate()
-        p.join(5)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
         try:
             parent_conn.close()
         except Exception:
             pass
-        return (module_name, 0.0, 0, [], "timeout", f"Timed out after {timeout_s}s")
+        return ScraperResult(module_name, 0.0, 0, [], "timeout", f"Timed out after {timeout_s}s")
 
-    msg = None
     try:
         if parent_conn.poll(1.0):
-            msg = parent_conn.recv()
-    except Exception as e:
+            message = parent_conn.recv()
+        else:
+            return ScraperResult(
+                module_name,
+                0.0,
+                0,
+                [],
+                "error",
+                "Scraper process exited without sending a result",
+            )
+    except Exception as exc:
+        return ScraperResult(module_name, 0.0, 0, [], "error", f"Failed reading result: {exc}")
+    finally:
         try:
             parent_conn.close()
         except Exception:
             pass
-        return (module_name, 0.0, 0, [], "error", f"Failed reading result from child: {e}")
 
+    if message[0] == "ok":
+        _, mod, duration, found, results = message
+        return ScraperResult(mod, float(duration), int(found), results, "ok")
+
+    _, mod, tb = message
+    return ScraperResult(mod, 0.0, 0, [], "error", tb)
+
+
+def _run_scraper_direct(module_name: str, url: str) -> ScraperResult:
     try:
-        parent_conn.close()
-    except Exception:
-        pass
-
-    if not msg:
-        return (module_name, 0.0, 0, [], "error", "Scraper process exited without sending a result")
-
-    if msg[0] == "ok":
-        _, mod, dt, found, results = msg
-        return (mod, float(dt), int(found), results, "ok", "")
-    else:
-        _, mod, tb = msg
-        return (mod, 0.0, 0, [], "error", tb)
-
-
-def _run_scraper_direct(module_name: str, url: str):
-    """
-    Runs inside current process/thread. Faster, but cannot be hard-killed.
-    """
-    try:
-        t0 = time.perf_counter()
+        started = time.perf_counter()
         module = importlib.import_module(f"scrapers.{module_name}")
         results = module.fetch(url)
-        dt = time.perf_counter() - t0
+        duration = time.perf_counter() - started
 
         if results is None:
             results = []
         if not isinstance(results, list):
-            raise TypeError(
-                f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}"
-            )
+            raise TypeError(f"{module_name}.fetch() must return list[dict], got {type(results)}")
 
-        return (module_name, float(dt), int(len(results)), results, "ok", "")
+        return ScraperResult(module_name, float(duration), len(results), results, "ok")
     except Exception:
-        return (module_name, 0.0, 0, [], "error", traceback.format_exc())
+        return ScraperResult(module_name, 0.0, 0, [], "error", traceback.format_exc())
 
 
-def run():
+def _run_scraper_once(module_name: str, url: str, timeout_s: int) -> ScraperResult:
+    if config.USE_SUBPROCESS:
+        return _run_scraper_with_timeout(module_name, url, timeout_s)
+    return _run_scraper_direct(module_name, url)
+
+
+def _run_scraper_with_retry(module_name: str, url: str, timeout_s: int) -> ScraperResult:
+    retries = int(getattr(config, "SCRAPER_RETRIES", 1))
+    backoff_s = float(getattr(config, "SCRAPER_RETRY_BACKOFF_S", 1.5))
+
+    attempts = max(1, retries + 1)
+    last_result = ScraperResult(module_name, 0.0, 0, [], "error", "No attempts executed")
+
+    for attempt in range(1, attempts + 1):
+        result = _run_scraper_once(module_name, url, timeout_s)
+
+        if result.status == "ok":
+            if attempt > 1:
+                logger.info("Scraper %s recovered on retry %s/%s", module_name, attempt, attempts)
+            return result
+
+        last_result = result
+        logger.warning(
+            "Scraper %s failed attempt %s/%s | status=%s",
+            module_name,
+            attempt,
+            attempts,
+            result.status,
+        )
+
+        if attempt < attempts:
+            time.sleep(backoff_s * attempt)
+
+    return last_result
+
+
+def _filter_and_validate(results: list[dict], wanted_location: str, module_name: str) -> tuple[list[dict], dict]:
+    filtered = list(results or [])
+    stats: dict[str, Any] = {"quality_reasons": {}}
+
+    if config.SWEDEN_ONLY:
+        before = _safe_len(filtered)
+        filtered = [item for item in filtered if _is_sweden_only(item)]
+        logger.info(
+            "Scraper %s: kept_after_sweden=%s (dropped=%s)",
+            module_name,
+            _safe_len(filtered),
+            before - _safe_len(filtered),
+        )
+
+    if wanted_location:
+        before = _safe_len(filtered)
+        filtered = [item for item in filtered if _matches_location_filter(item, wanted_location)]
+        logger.info(
+            "Scraper %s: kept_after_location=%s (dropped=%s)",
+            module_name,
+            _safe_len(filtered),
+            before - _safe_len(filtered),
+        )
+
+    reasons = Counter()
+    validated: list[dict] = []
+    for item in filtered:
+        ok, reason = validate_assignment(item)
+        if not ok:
+            reasons[reason] += 1
+            continue
+        validated.append(item)
+
+    stats["quality_reasons"] = dict(reasons)
+
+    if reasons:
+        top = ", ".join(f"{key}={value}" for key, value in reasons.most_common(6))
+        logger.info("Scraper %s: dropped_by_quality=%s (%s)", module_name, sum(reasons.values()), top)
+    else:
+        logger.info("Scraper %s: dropped_by_quality=0", module_name)
+
+    logger.info("Scraper %s: kept=%s after filters", module_name, len(validated))
+    return validated, stats
+
+
+def run() -> None:
     wanted = _get_location_filter()
-
     http_sem = threading.Semaphore(max(1, config.HTTP_WORKERS))
     browser_sem = threading.Semaphore(max(1, config.BROWSER_WORKERS))
 
@@ -187,117 +266,96 @@ def run():
 
     total_found = 0
     total_kept = 0
+    total_inserted = 0
+    total_updated = 0
+    total_skipped_in_save = 0
 
-    def _run_gated(module_name: str, url: str, timeout_s: int, engine: str):
-        sem = browser_sem if engine == "browser" else http_sem
-        logger.info("Waiting slot: %s | engine=%s", module_name, engine)
+    def run_gated(scraper: ScraperConfig) -> tuple[ScraperConfig, ScraperResult]:
+        sem = browser_sem if scraper.engine == "browser" else http_sem
+        logger.info("Waiting slot: %s | engine=%s", scraper.module, scraper.engine)
         with sem:
-            logger.info("Running: %s | engine=%s | timeout=%ss", module_name, engine, timeout_s)
-            if config.USE_SUBPROCESS:
-                return _run_scraper_with_timeout(module_name, url, timeout_s)
-            return _run_scraper_direct(module_name, url)
+            logger.info(
+                "Running: %s | engine=%s | timeout=%ss",
+                scraper.module,
+                scraper.engine,
+                scraper.timeout_s,
+            )
+            result = _run_scraper_with_retry(scraper.module, scraper.url, scraper.timeout_s)
+            return scraper, result
 
     futures = {}
-    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
-        for conf in SCRAPERS:
-            module_name = conf["module"]
-            url = conf["url"]
-            timeout_s = int(conf.get("timeout_s", config.SCRAPER_TIMEOUT_S))
-            engine = (conf.get("engine") or "http").strip().lower()
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        for scraper in SCRAPERS:
+            logger.info("Queued: %s | engine=%s", scraper.module, scraper.engine)
+            future = executor.submit(run_gated, scraper)
+            futures[future] = scraper
 
-            logger.info("Queued: %s | engine=%s", module_name, engine)
-            fut = pool.submit(_run_gated, module_name, url, timeout_s, engine)
-            futures[fut] = {
-                "module": module_name,
-                "url": url,
-                "timeout_s": timeout_s,
-                "engine": engine,
-            }
-
-        for fut in as_completed(futures):
-            meta = futures[fut]
-            module_name = meta["module"]
-            url = meta["url"]
-            timeout_s = meta["timeout_s"]
-            engine = meta["engine"]
+        for future in as_completed(futures):
+            scraper = futures[future]
 
             try:
-                mod, fetch_s, found, results, status, err = fut.result()
-            except Exception as e:
-                logger.exception("Scraper %s failed (executor): %s", module_name, e)
+                _, result = future.result()
+            except Exception as exc:
+                logger.exception("Scraper %s crashed in executor: %s", scraper.module, exc)
                 continue
 
-            if status == "timeout":
+            if result.status == "timeout":
                 logger.warning(
                     "Scraper %s timed out after %ss | engine=%s | url=%s",
-                    mod,
-                    timeout_s,
-                    engine,
-                    url,
+                    scraper.module,
+                    scraper.timeout_s,
+                    scraper.engine,
+                    scraper.url,
                 )
                 continue
 
-            if status == "error":
-                logger.error("Scraper %s failed | engine=%s:\n%s", mod, engine, err)
+            if result.status == "error":
+                logger.error(
+                    "Scraper %s failed | engine=%s:\n%s",
+                    scraper.module,
+                    scraper.engine,
+                    result.error,
+                )
                 continue
 
-            total_found += found
-            logger.info("Scraper %s: found=%s | fetch=%.2fs | engine=%s", mod, found, fetch_s, engine)
+            total_found += result.found
+            logger.info(
+                "Scraper %s: found=%s | fetch=%.2fs | engine=%s",
+                scraper.module,
+                result.found,
+                result.fetch_s,
+                scraper.engine,
+            )
 
-            if results is None:
-                results = []
-            if not isinstance(results, list):
-                logger.error("Scraper %s returned non-list: %s", mod, type(results))
-                continue
+            validated, _stats = _filter_and_validate(result.results, wanted, scraper.module)
+            total_kept += len(validated)
 
-            filtered = list(results)
+            save_stats = save_assignments(validated)
+            total_inserted += save_stats["inserted"]
+            total_updated += save_stats["updated"]
+            total_skipped_in_save += save_stats["skipped"]
 
-            if config.SWEDEN_ONLY:
-                before = _safe_len(filtered)
-                filtered = [a for a in filtered if _is_sweden_only(a)]
-                logger.info(
-                    "Scraper %s: kept_after_sweden=%s (dropped=%s)",
-                    mod,
-                    _safe_len(filtered),
-                    before - _safe_len(filtered),
-                )
-
-            if wanted:
-                before = _safe_len(filtered)
-                filtered = [a for a in filtered if _matches_location_filter(a, wanted)]
-                logger.info(
-                    "Scraper %s: kept_after_location=%s (dropped=%s)",
-                    mod,
-                    _safe_len(filtered),
-                    before - _safe_len(filtered),
-                )
-
-            reasons = Counter()
-            validated = []
-            for a in filtered:
-                ok, reason = validate_assignment(a)
-                if not ok:
-                    reasons[reason] += 1
-                    continue
-                validated.append(a)
-
-            dropped_q = sum(reasons.values())
-            if dropped_q:
-                top = ", ".join([f"{k}={v}" for k, v in reasons.most_common(6)])
-                logger.info("Scraper %s: dropped_by_quality=%s (%s)", mod, dropped_q, top)
-            else:
-                logger.info("Scraper %s: dropped_by_quality=0", mod)
-
-            kept = _safe_len(validated)
-            total_kept += kept
-
-            logger.info("Scraper %s: kept=%s after filters", mod, kept)
-            save_assignments(validated)
+            logger.info(
+                "Scraper %s: batch_duplicates=%s db_inserted=%s db_updated=%s skipped_in_save=%s",
+                scraper.module,
+                save_stats["batch_duplicates"],
+                save_stats["inserted"],
+                save_stats["updated"],
+                save_stats["skipped"],
+            )
 
     if OUTPUTS.get("excel", True):
-        export_all()
+        export_stats = export_all()
+        logger.info("Exported rows=%s", export_stats["rows"])
 
-    logger.info("Done. Total found=%s kept=%s", total_found, total_kept)
+    logger.info(
+        "Done. Total found=%s kept=%s inserted=%s updated=%s skipped_in_save=%s",
+        total_found,
+        total_kept,
+        total_inserted,
+        total_updated,
+        total_skipped_in_save,
+    )
 
 
 if __name__ == "__main__":
