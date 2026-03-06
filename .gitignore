@@ -1,31 +1,29 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
-# virtual env
+# Virtual environments
 .venv/
 venv/
 
-# environment variables
+# Environment variables
 .env
 
-# exports
+# Local config (should not be committed)
+config.py
+
+# Database
+*.db
+*.sqlite3
+
+# Exports / generated files
 exports/
 
-# database
-*.db
-
-# IDE
+# IDE / editor settings
 .vscode/
 .idea/
 
-__pycache__/
-*.pyc
-.venv/
-venv/
-.env
-config.py
-exports/
-*.db
-.vscode/
-.idea/config.py
+# OS
+.DS_Store
+Thumbs.db

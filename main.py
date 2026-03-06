@@ -1,6 +1,5 @@
 import importlib
 import logging
-import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,38 +8,20 @@ import traceback
 from typing import Any
 import threading
 
-from geo import is_sweden_assignment
+import config
 
+from geo import is_sweden_assignment
 from app_config import SCRAPERS, OUTPUTS
 from database import init_db, save_assignments
 from export import export_all
 from quality import validate_assignment
 
 logger = logging.getLogger(__name__)
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
-SCRAPER_TIMEOUT_S = int(os.getenv("SCRAPER_TIMEOUT_S", "180"))
-
-HTTP_WORKERS = int(os.getenv("HTTP_WORKERS", str(MAX_WORKERS)))
-BROWSER_WORKERS = int(os.getenv("BROWSER_WORKERS", "1"))
-
-SWEDEN_ONLY = os.getenv("SWEDEN_ONLY", "1").strip().lower() in (
-    "1", "true", "yes", "y", "on"
-)
-
-USE_SUBPROCESS = os.getenv("USE_SUBPROCESS", "1").strip().lower() in (
-    "1", "true", "yes", "y", "on"
-)
-
-# IMPORTANT:
-# Use "spawn" context to avoid deadlocks when starting processes from worker threads.
-MP_CTX = mp.get_context("spawn")
 
 
 def _is_sweden_only(item: dict) -> bool:
@@ -48,11 +29,7 @@ def _is_sweden_only(item: dict) -> bool:
 
 
 def _get_location_filter() -> str:
-    for key in ("LOCATION_FILTER", "FILTER_LOCATION"):
-        v = os.getenv(key, "").strip().lower()
-        if v:
-            return v
-    return ""
+    return (config.LOCATION_FILTER or "").strip().lower()
 
 
 def _matches_location_filter(item: dict, wanted: str) -> bool:
@@ -69,9 +46,8 @@ def _safe_len(x: Any) -> int:
 
 
 def _child_logging_init() -> None:
-    level = (os.getenv("LOG_LEVEL") or "INFO").upper()
     logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
@@ -87,7 +63,9 @@ def _scraper_process_entry(conn, module_name: str, url: str) -> None:
         if results is None:
             results = []
         if not isinstance(results, list):
-            raise TypeError(f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}")
+            raise TypeError(
+                f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}"
+            )
 
         conn.send(("ok", module_name, float(dt), int(len(results)), results))
     except Exception:
@@ -105,8 +83,8 @@ def _run_scraper_with_timeout(module_name: str, url: str, timeout_s: int):
     Returns: (module, fetch_s, found, results, status, err)
     status: ok | timeout | error
     """
-    parent_conn, child_conn = MP_CTX.Pipe(duplex=False)
-    p = MP_CTX.Process(
+    parent_conn, child_conn = config.MP_CTX.Pipe(duplex=False)
+    p = config.MP_CTX.Process(
         target=_scraper_process_entry,
         args=(child_conn, module_name, url),
         daemon=True,
@@ -178,7 +156,9 @@ def _run_scraper_direct(module_name: str, url: str):
         if results is None:
             results = []
         if not isinstance(results, list):
-            raise TypeError(f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}")
+            raise TypeError(
+                f"Scraper {module_name}.fetch() must return list[dict], got {type(results)}"
+            )
 
         return (module_name, float(dt), int(len(results)), results, "ok", "")
     except Exception:
@@ -188,19 +168,19 @@ def _run_scraper_direct(module_name: str, url: str):
 def run():
     wanted = _get_location_filter()
 
-    http_sem = threading.Semaphore(max(1, HTTP_WORKERS))
-    browser_sem = threading.Semaphore(max(1, BROWSER_WORKERS))
+    http_sem = threading.Semaphore(max(1, config.HTTP_WORKERS))
+    browser_sem = threading.Semaphore(max(1, config.BROWSER_WORKERS))
 
     logger.info(
         "Starting run. Sweden-only=%s | Location filter='%s' | Scrapers=%s | "
         "MAX_WORKERS=%s HTTP_WORKERS=%s BROWSER_WORKERS=%s USE_SUBPROCESS=%s (mp=spawn)",
-        SWEDEN_ONLY,
+        config.SWEDEN_ONLY,
         wanted if wanted else "<none>",
         len(SCRAPERS),
-        MAX_WORKERS,
-        HTTP_WORKERS,
-        BROWSER_WORKERS,
-        USE_SUBPROCESS,
+        config.MAX_WORKERS,
+        config.HTTP_WORKERS,
+        config.BROWSER_WORKERS,
+        config.USE_SUBPROCESS,
     )
 
     init_db()
@@ -213,21 +193,26 @@ def run():
         logger.info("Waiting slot: %s | engine=%s", module_name, engine)
         with sem:
             logger.info("Running: %s | engine=%s | timeout=%ss", module_name, engine, timeout_s)
-            if USE_SUBPROCESS:
+            if config.USE_SUBPROCESS:
                 return _run_scraper_with_timeout(module_name, url, timeout_s)
             return _run_scraper_direct(module_name, url)
 
     futures = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
         for conf in SCRAPERS:
             module_name = conf["module"]
             url = conf["url"]
-            timeout_s = int(conf.get("timeout_s", SCRAPER_TIMEOUT_S))
+            timeout_s = int(conf.get("timeout_s", config.SCRAPER_TIMEOUT_S))
             engine = (conf.get("engine") or "http").strip().lower()
 
             logger.info("Queued: %s | engine=%s", module_name, engine)
             fut = pool.submit(_run_gated, module_name, url, timeout_s, engine)
-            futures[fut] = {"module": module_name, "url": url, "timeout_s": timeout_s, "engine": engine}
+            futures[fut] = {
+                "module": module_name,
+                "url": url,
+                "timeout_s": timeout_s,
+                "engine": engine,
+            }
 
         for fut in as_completed(futures):
             meta = futures[fut]
@@ -243,7 +228,13 @@ def run():
                 continue
 
             if status == "timeout":
-                logger.warning("Scraper %s timed out after %ss | engine=%s | url=%s", mod, timeout_s, engine, url)
+                logger.warning(
+                    "Scraper %s timed out after %ss | engine=%s | url=%s",
+                    mod,
+                    timeout_s,
+                    engine,
+                    url,
+                )
                 continue
 
             if status == "error":
@@ -261,7 +252,7 @@ def run():
 
             filtered = list(results)
 
-            if SWEDEN_ONLY:
+            if config.SWEDEN_ONLY:
                 before = _safe_len(filtered)
                 filtered = [a for a in filtered if _is_sweden_only(a)]
                 logger.info(
