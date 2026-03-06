@@ -18,3 +18,14 @@ exports/
 # IDE
 .vscode/
 .idea/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+config.py
+exports/
+*.db
+.vscode/
+.idea/config.py
