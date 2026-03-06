@@ -1,7 +1,7 @@
 import os
 import multiprocessing as mp
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "database.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "assignments.db")
 LOCATION_FILTER = os.getenv("LOCATION_FILTER", "<city>").strip()
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
