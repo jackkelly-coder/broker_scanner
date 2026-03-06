@@ -1,14 +1,22 @@
-# database.py
 import os
 import sqlite3
 from datetime import datetime, timezone
 import hashlib
 
+import config
+
 from geo import compute_location_bucket
 from utils import canonicalize_url, clean_text
 
 BASE_DIR = os.path.dirname(__file__)
-DB_NAME = os.path.join(BASE_DIR, "assignments.db")
+
+# If DATABASE_PATH is relative, keep it relative to project root.
+# If it's absolute, use it as-is.
+DB_NAME = (
+    config.DATABASE_PATH
+    if os.path.isabs(config.DATABASE_PATH)
+    else os.path.join(BASE_DIR, config.DATABASE_PATH)
+)
 
 # ----------------------------
 # Company normalization
@@ -18,8 +26,7 @@ COMPANY_ALIASES = {
     "e work": "Ework",
     "ework": "Ework",
     "e-work group": "Ework",
-
-    "emagine": "emagine",  # keep as-is
+    "emagine": "emagine",
     "tingent": "Tingent",
     "a society": "A Society",
     "bohmans": "Bohmans",
@@ -31,6 +38,7 @@ COMPANY_ALIASES = {
     "teksystems": "Teksystems",
     "verama": "Verama",
 }
+
 
 def normalize_company(company: str) -> str:
     c = clean_text(company or "")
@@ -108,11 +116,9 @@ def init_db():
     )
     """)
 
-    # Migration: add location_bucket if missing
     if not _column_exists(cursor, "assignments", "location_bucket"):
         cursor.execute("ALTER TABLE assignments ADD COLUMN location_bucket TEXT")
 
-    # Backfill missing location_bucket (best effort)
     cursor.execute("SELECT id, title, location, location_bucket FROM assignments")
     rows = cursor.fetchall()
     for assignment_id, title, location, bucket in rows:
@@ -124,15 +130,14 @@ def init_db():
             (b, assignment_id),
         )
 
-    # Remove duplicates before enforcing uniqueness
     deleted = _dedup_existing_rows(conn)
     if deleted:
         print(f"[db] Dedup migration: deleted {deleted} duplicate rows (company,url)")
 
-    # Enforce unique (company,url)
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_assignments_company_url ON assignments(company, url)")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_assignments_company_url ON assignments(company, url)"
+    )
 
-    # Helpful indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_company ON assignments(company)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_location ON assignments(location)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_location_bucket ON assignments(location_bucket)")
@@ -178,10 +183,8 @@ def save_assignments(assignments):
         if not title or not company or not url_raw:
             continue
 
-        # Canonicalize URL in ONE place
         url = canonicalize_url(url_raw)
 
-        # Global junk filters (keep DB clean)
         if company == "Tingent" and title.strip('"').lower() == "jobs":
             continue
         if company == "A Society" and title.lower() == "english":
@@ -210,7 +213,7 @@ def save_assignments(assignments):
             location_bucket,
             published,
             url,
-            now_utc
+            now_utc,
         ))
 
     conn.commit()
