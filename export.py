@@ -1,20 +1,19 @@
 import csv
 import os
-import sqlite3
 from typing import Sequence
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 import app_config
-from database import DB_NAME
+from database import _connect
 
 XLSX_PATH = os.path.join(app_config.EXPORT_DIR, "assignments.xlsx")
 CSV_PATH = os.path.join(app_config.EXPORT_DIR, "assignments.csv")
 
 
 def fetch_assignments() -> tuple[list[str], list[tuple]]:
-    conn = sqlite3.connect(DB_NAME)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         """
@@ -26,7 +25,7 @@ def fetch_assignments() -> tuple[list[str], list[tuple]]:
             published,
             url,
             scraped_at
-        FROM assignments
+        FROM dbo.assignments
         ORDER BY scraped_at DESC, company ASC, title ASC
         """
     )
@@ -42,7 +41,10 @@ def fetch_assignments() -> tuple[list[str], list[tuple]]:
         "url",
         "scraped_at",
     ]
-    return headers, rows
+
+    # pyodbc.Row -> tuple
+    normalized_rows = [tuple(row) for row in rows]
+    return headers, normalized_rows
 
 
 def export_csv(headers: Sequence[str], rows: Sequence[Sequence]) -> None:
@@ -72,8 +74,8 @@ def export_xlsx(headers: Sequence[str], rows: Sequence[Sequence]) -> None:
         url_value = row[url_column_index - 1]
         if url_value:
             cell = worksheet.cell(row=row_index, column=url_column_index)
-            cell.hyperlink = url_value
-            cell.value = url_value
+            cell.hyperlink = str(url_value)
+            cell.value = str(url_value)
             cell.style = "Hyperlink"
 
     for col_index in range(1, len(headers) + 1):

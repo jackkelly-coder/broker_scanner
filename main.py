@@ -11,10 +11,11 @@ from typing import Any
 
 import config
 from app_config import OUTPUTS, SCRAPERS, ScraperConfig
-from database import init_db, save_assignments
+from database import init_db, save_assignments, sync_assignments
 from export import export_all
 from geo import is_sweden_assignment
 from quality import validate_assignment
+from utils import canonicalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,7 @@ def run() -> None:
     total_inserted = 0
     total_updated = 0
     total_skipped_in_save = 0
+    all_current_urls: set[str] = set()
 
     def run_gated(scraper: ScraperConfig) -> tuple[ScraperConfig, ScraperResult]:
         sem = browser_sem if scraper.engine == "browser" else http_sem
@@ -327,13 +329,31 @@ def run() -> None:
                 scraper.engine,
             )
 
-            validated, _stats = _filter_and_validate(result.results, wanted, scraper.module)
+            validated, stats = _filter_and_validate(result.results, wanted, scraper.module)
+            logger.info(
+                "Scraper %s: raw=%s validated=%s stats=%s",
+                scraper.module,
+                len(result.results),
+                len(validated),
+                stats,
+            )
             total_kept += len(validated)
 
             save_stats = save_assignments(validated)
+            logger.info("Scraper %s: save_stats=%s", scraper.module, save_stats)
+
+            for item in validated:
+                if item.get("url"):
+                    all_current_urls.add(canonicalize_url(item["url"]))
+
+
             total_inserted += save_stats["inserted"]
             total_updated += save_stats["updated"]
             total_skipped_in_save += save_stats["skipped"]
+
+            # Sync: remove old assignments not in current scrape
+            # Sync: remove old assignments not in current scrape
+
 
             logger.info(
                 "Scraper %s: batch_duplicates=%s db_inserted=%s db_updated=%s skipped_in_save=%s",
@@ -344,16 +364,26 @@ def run() -> None:
                 save_stats["skipped"],
             )
 
-    if OUTPUTS.get("excel", True):
-        export_stats = export_all()
-        logger.info("Exported rows=%s", export_stats["rows"])
+
+        total_deleted = 0
+
+        if all_current_urls:
+            total_deleted = sync_assignments(all_current_urls)
+            logger.info("Final sync deleted=%s", total_deleted)
+        else:
+            logger.warning("Final sync skipped because all_current_urls was empty")
+        
+        if OUTPUTS.get("excel", True):
+            export_stats = export_all()
+            logger.info("Exported rows=%s", export_stats["rows"])
 
     logger.info(
-        "Done. Total found=%s kept=%s inserted=%s updated=%s skipped_in_save=%s",
+        "Done. Total found=%s kept=%s inserted=%s updated=%s deleted=%s skipped_in_save=%s",
         total_found,
         total_kept,
         total_inserted,
         total_updated,
+        total_deleted,
         total_skipped_in_save,
     )
 

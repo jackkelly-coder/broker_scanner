@@ -1,6 +1,6 @@
 import hashlib
 import os
-import sqlite3
+import pyodbc
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -8,12 +8,6 @@ import config
 from geo import compute_location_bucket
 from utils import canonicalize_url, clean_text
 
-BASE_DIR = os.path.dirname(__file__)
-DB_NAME = (
-    config.DATABASE_PATH
-    if os.path.isabs(config.DATABASE_PATH)
-    else os.path.join(BASE_DIR, config.DATABASE_PATH)
-)
 
 COMPANY_ALIASES = {
     "e-work": "Ework",
@@ -41,32 +35,41 @@ def normalize_company(company: str) -> str:
     return COMPANY_ALIASES.get(cleaned.lower(), cleaned)
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+def _connect():
+    conn_str = (
+        f"DRIVER={{{config.SQL_DRIVER}}};"
+        f"SERVER={config.SQL_SERVER};"
+        f"DATABASE={config.SQL_DATABASE};"
+        "Trusted_Connection=yes;"
+    )
+    return pyodbc.connect(conn_str)
 
 
-def _column_exists(cursor: sqlite3.Cursor, table: str, column: str) -> bool:
-    cursor.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == column for row in cursor.fetchall())
+def _column_exists(cursor, table: str, column: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = ? AND COLUMN_NAME = ?
+        """,
+        (table, column),
+    )
+    return cursor.fetchone() is not None
 
 
 def _stable_id(company: str, url: str) -> str:
     key = f"{company}|{url}".encode("utf-8")
     return hashlib.md5(key).hexdigest()
 
-
-def _dedup_existing_rows(conn: sqlite3.Connection) -> int:
+def _dedup_existing_rows(conn) -> int:
     cur = conn.cursor()
     cur.execute(
         """
         SELECT company, url, COUNT(*)
-        FROM assignments
+        FROM dbo.assignments
         WHERE company IS NOT NULL
           AND url IS NOT NULL
-          AND url != ''
+          AND url <> ''
         GROUP BY company, url
         HAVING COUNT(*) > 1
         """
@@ -80,7 +83,7 @@ def _dedup_existing_rows(conn: sqlite3.Connection) -> int:
         cur.execute(
             """
             SELECT id, scraped_at
-            FROM assignments
+            FROM dbo.assignments
             WHERE company = ? AND url = ?
             ORDER BY scraped_at DESC
             """,
@@ -88,11 +91,12 @@ def _dedup_existing_rows(conn: sqlite3.Connection) -> int:
         )
         rows = cur.fetchall()
         for row_id, _ in rows[1:]:
-            cur.execute("DELETE FROM assignments WHERE id = ?", (row_id,))
+            cur.execute("DELETE FROM dbo.assignments WHERE id = ?", (row_id,))
             deleted += 1
 
     conn.commit()
     return deleted
+
 
 
 def init_db() -> None:
@@ -101,64 +105,116 @@ def init_db() -> None:
 
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS assignments (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            company TEXT NOT NULL,
-            location TEXT,
-            location_bucket TEXT,
-            published TEXT,
-            url TEXT NOT NULL,
-            scraped_at TEXT NOT NULL
-        )
+        IF OBJECT_ID('dbo.assignments', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.assignments (
+                id NVARCHAR(36) NOT NULL PRIMARY KEY,
+                title NVARCHAR(500) NOT NULL,
+                company NVARCHAR(255) NOT NULL,
+                location NVARCHAR(255) NULL,
+                location_bucket NVARCHAR(255) NULL,
+                published NVARCHAR(100) NULL,
+                url NVARCHAR(1000) NOT NULL,
+                scraped_at NVARCHAR(50) NOT NULL,
+                first_scraped_at NVARCHAR(50) NULL
+            )
+        END
         """
     )
 
     if not _column_exists(cur, "assignments", "location_bucket"):
-        cur.execute("ALTER TABLE assignments ADD COLUMN location_bucket TEXT")
+        cur.execute("ALTER TABLE dbo.assignments ADD location_bucket NVARCHAR(255) NULL")
 
-    cur.execute("SELECT id, title, location, location_bucket FROM assignments")
+    if not _column_exists(cur, "assignments", "first_scraped_at"):
+        cur.execute("ALTER TABLE dbo.assignments ADD first_scraped_at NVARCHAR(50) NULL")
+
+    cur.execute("SELECT id, title, location, location_bucket FROM dbo.assignments")
     for assignment_id, title, location, bucket in cur.fetchall():
         if bucket:
             continue
         cur.execute(
-            "UPDATE assignments SET location_bucket = ? WHERE id = ?",
+            "UPDATE dbo.assignments SET location_bucket = ? WHERE id = ?",
             (compute_location_bucket(location or "", title or ""), assignment_id),
         )
+
+    cur.execute(
+        """
+        UPDATE dbo.assignments
+        SET first_scraped_at = scraped_at
+        WHERE first_scraped_at IS NULL
+        """
+    )
 
     _dedup_existing_rows(conn)
 
     cur.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_assignments_company_url ON assignments(company, url)"
+        """
+        IF NOT EXISTS (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = 'ux_assignments_url'
+              AND object_id = OBJECT_ID('dbo.assignments')
+        )
+        CREATE UNIQUE INDEX ux_assignments_url
+        ON dbo.assignments(url)
+        """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_company ON assignments(company)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_location ON assignments(location)")
+
     cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_assignments_location_bucket ON assignments(location_bucket)"
+        """
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = 'idx_assignments_company'
+              AND object_id = OBJECT_ID('dbo.assignments')
+        )
+        CREATE INDEX idx_assignments_company
+        ON dbo.assignments(company)
+        """
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_scraped_at ON assignments(scraped_at)")
+
+    cur.execute(
+        """
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = 'idx_assignments_location'
+              AND object_id = OBJECT_ID('dbo.assignments')
+        )
+        CREATE INDEX idx_assignments_location
+        ON dbo.assignments(location)
+        """
+    )
+
+    cur.execute(
+        """
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = 'idx_assignments_location_bucket'
+              AND object_id = OBJECT_ID('dbo.assignments')
+        )
+        CREATE INDEX idx_assignments_location_bucket
+        ON dbo.assignments(location_bucket)
+        """
+    )
+
+    cur.execute(
+        """
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.indexes
+            WHERE name = 'idx_assignments_scraped_at'
+              AND object_id = OBJECT_ID('dbo.assignments')
+        )
+        CREATE INDEX idx_assignments_scraped_at
+        ON dbo.assignments(scraped_at)
+        """
+    )
 
     conn.commit()
     conn.close()
 
-
 def save_assignments(assignments: Iterable[dict]) -> dict:
-    """
-    Saves assignments with:
-    - in-memory batch dedupe on (company, canonical_url)
-    - DB-level dedupe on (company, url)
-
-    Returns stats:
-    {
-        "input": int,
-        "valid_rows": int,
-        "batch_duplicates": int,
-        "inserted": int,
-        "updated": int,
-        "skipped": int,
-    }
-    """
     raw_items = list(assignments or [])
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
     if not raw_items:
         return {
             "input": 0,
@@ -166,10 +222,9 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
             "batch_duplicates": 0,
             "inserted": 0,
             "updated": 0,
+            "deleted": 0,
             "skipped": 0,
         }
-
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
     prepared_rows = []
     skipped = 0
@@ -181,7 +236,7 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
 
         title = clean_text(item.get("title") or "")
         company = normalize_company(item.get("company") or "")
-        location = clean_text(item.get("location") or "")
+        location = normalize_location(item.get("location") or "")
         published = clean_text(item.get("published") or "")
         raw_url = clean_text(item.get("url") or "")
 
@@ -199,7 +254,7 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
             skipped += 1
             continue
 
-        location_bucket = compute_location_bucket(location, title)
+        location_bucket = normalize_location_bucket(item.get("location") or "")
         assignment_id = _stable_id(company, url)
 
         prepared_rows.append(
@@ -212,18 +267,18 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
                 "published": published,
                 "url": url,
                 "scraped_at": now_utc,
+                "first_scraped_at": now_utc,
             }
         )
 
     valid_rows = len(prepared_rows)
 
-    # Batch dedupe before DB writes.
-    deduped_by_key: dict[tuple[str, str], dict] = {}
+    # Deduplicera på url
+    deduped_by_url: dict[str, dict] = {}
     for row in prepared_rows:
-        key = (row["company"], row["url"])
-        deduped_by_key[key] = row
+        deduped_by_url[row["url"]] = row
 
-    deduped_rows = list(deduped_by_key.values())
+    deduped_rows = list(deduped_by_url.values())
     batch_duplicates = valid_rows - len(deduped_rows)
 
     conn = _connect()
@@ -231,44 +286,72 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
 
     inserted = 0
     updated = 0
+    deleted = 0
+
+    incoming_urls = {row["url"] for row in deduped_rows}
+
+    # Hämta befintliga URL:er
+    cur.execute("SELECT url, first_scraped_at FROM dbo.assignments")
+    existing = {row[0]: row[1] for row in cur.fetchall()}
 
     for row in deduped_rows:
-        cur.execute(
-            "SELECT 1 FROM assignments WHERE company = ? AND url = ? LIMIT 1",
-            (row["company"], row["url"]),
-        )
-        exists = cur.fetchone() is not None
+        existing_first_scraped_at = existing.get(row["url"])
 
-        cur.execute(
-            """
-            INSERT INTO assignments (
-                id, title, company, location, location_bucket, published, url, scraped_at
+        if existing_first_scraped_at:
+            cur.execute(
+                """
+                UPDATE dbo.assignments
+                SET
+                    id = ?,
+                    title = ?,
+                    company = ?,
+                    location = ?,
+                    location_bucket = ?,
+                    published = ?,
+                    scraped_at = ?
+                WHERE url = ?
+                """,
+                (
+                    row["id"],
+                    row["title"],
+                    row["company"],
+                    row["location"],
+                    row["location_bucket"],
+                    row["published"],
+                    row["scraped_at"],
+                    row["url"],
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(company, url) DO UPDATE SET
-                id = excluded.id,
-                title = excluded.title,
-                location = excluded.location,
-                location_bucket = excluded.location_bucket,
-                published = excluded.published,
-                scraped_at = excluded.scraped_at
-            """,
-            (
-                row["id"],
-                row["title"],
-                row["company"],
-                row["location"],
-                row["location_bucket"],
-                row["published"],
-                row["url"],
-                row["scraped_at"],
-            ),
-        )
-
-        if exists:
             updated += 1
         else:
+            cur.execute(
+                """
+                INSERT INTO dbo.assignments (
+                    id, title, company, location, location_bucket,
+                    published, url, scraped_at, first_scraped_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["title"],
+                    row["company"],
+                    row["location"],
+                    row["location_bucket"],
+                    row["published"],
+                    row["url"],
+                    row["scraped_at"],
+                    row["first_scraped_at"],
+                ),
+            )
             inserted += 1
+
+    # Radera poster som inte längre finns i senaste hämtningen
+    # if deduped_rows:
+    #     urls_to_delete = set(existing.keys()) - incoming_urls
+    #     for url in urls_to_delete:
+    #         cur.execute("DELETE FROM dbo.assignments WHERE url = ?", (url,))
+    #         deleted += 1
 
     conn.commit()
     conn.close()
@@ -279,5 +362,55 @@ def save_assignments(assignments: Iterable[dict]) -> dict:
         "batch_duplicates": batch_duplicates,
         "inserted": inserted,
         "updated": updated,
+        "deleted": deleted,
         "skipped": skipped,
     }
+
+def sync_assignments(current_urls: set[str] | list[str]) -> int:
+    urls = {u for u in (current_urls or []) if u}
+    if not urls:
+        return 0
+
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT url FROM dbo.assignments")
+    existing_urls = {row[0] for row in cur.fetchall() if row[0]}
+
+    urls_to_delete = existing_urls - urls
+    deleted = 0
+
+    for url in urls_to_delete:
+        cur.execute("DELETE FROM dbo.assignments WHERE url = ?", (url,))
+        deleted += 1
+
+    conn.commit()
+    conn.close()
+    return deleted
+
+def normalize_location(location: str) -> str:
+    value = clean_text(location or "")
+    if not value:
+        return ""
+
+    value = value.replace("Sweden", "")
+    value = value.replace("Sverige", "")
+    value = value.strip(" ,")
+
+    if not value:
+        return ""
+
+    return value.split()[0]
+
+def normalize_location_bucket(location: str) -> str:
+    value = clean_text(location or "")
+    if not value:
+        return ""
+
+    value = value.replace(",", " ")
+    value = value.strip()
+
+    if not value:
+        return ""
+
+    return value.split()[0]

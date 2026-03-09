@@ -12,6 +12,7 @@ def env_bool(key: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+
 @dataclass(frozen=True)
 class ScraperConfig:
     module: str
