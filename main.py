@@ -7,11 +7,12 @@ import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import config
 from app_config import OUTPUTS, SCRAPERS, ScraperConfig
-from database import init_db, save_assignments, sync_assignments
+from database import init_db, save_assignments, sync_assignments, log_scraper_result
 from export import export_all
 from geo import is_sweden_assignment
 from quality import validate_assignment
@@ -297,6 +298,8 @@ def run() -> None:
 
             try:
                 _, result = future.result()
+                timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                log_scraper_result(scraper.module, result.status, timestamp, result.error)
             except Exception as exc:
                 logger.exception("Scraper %s crashed in executor: %s", scraper.module, exc)
                 continue

@@ -208,6 +208,20 @@ def init_db() -> None:
         """
     )
 
+    cur.execute(
+        """
+        IF OBJECT_ID('dbo.broker_scrape_logs', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.broker_scrape_logs (
+                broker_name NVARCHAR(255) NOT NULL PRIMARY KEY,
+                last_scrape_status NVARCHAR(50) NOT NULL,
+                last_scrape_timestamp NVARCHAR(50) NOT NULL,
+                last_error_message NVARCHAR(MAX) NULL
+            )
+        END
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -388,6 +402,36 @@ def sync_assignments(current_urls: set[str] | list[str]) -> int:
     conn.close()
     return deleted
 
+def log_scraper_result(broker_name: str, status: str, timestamp: str, error: str = "") -> None:
+    conn = _connect()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE dbo.broker_scrape_logs
+        SET
+            last_scrape_status = ?,
+            last_scrape_timestamp = ?,
+            last_error_message = CASE WHEN ? = 'ok' THEN NULL ELSE ? END
+        WHERE broker_name = ?
+        """,
+        (status, timestamp, status, error, broker_name),
+    )
+
+    if cur.rowcount == 0:
+        cur.execute(
+            """
+            INSERT INTO dbo.broker_scrape_logs
+                (broker_name, last_scrape_status, last_scrape_timestamp, last_error_message)
+            VALUES
+                (?, ?, ?, CASE WHEN ? = 'ok' THEN NULL ELSE ? END)
+            """,
+            (broker_name, status, timestamp, status, error),
+        )
+
+    conn.commit()
+    conn.close()
+
 def normalize_location(location: str) -> str:
     value = clean_text(location or "")
     if not value:
@@ -395,12 +439,13 @@ def normalize_location(location: str) -> str:
 
     value = value.replace("Sweden", "")
     value = value.replace("Sverige", "")
-    value = value.strip(" ,")
+    value = value.replace(",", " ")
+    value = value.strip()
 
     if not value:
         return ""
 
-    return value.split()[0]
+    return value.split()[0].strip(" ,")
 
 def normalize_location_bucket(location: str) -> str:
     value = clean_text(location or "")
